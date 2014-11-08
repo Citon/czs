@@ -213,7 +213,7 @@ def configure (conffile):
     Read configuration file into the global config dictionary and ensure sections are present
     """
 
-    # Perform a quick (but race vulnerable) config file existance and permission
+    # Perform a quick (but race vulnerable) config file existence and permission
     # check.
     try:
         # Open the config for reading (or fail)
@@ -230,7 +230,7 @@ def configure (conffile):
     config.readfp(conffilefp)
     
     if not config.has_section('system'):
-        raise GeneralError("No [system] seciton in configuration file %s - EXITING" % conffile)
+        raise GeneralError("No [system] section in configuration file %s - EXITING" % conffile)
 
     # System config
     config['system']['target_name'] = config.get('system', 'target_name', fallback='iqn.1997-03.com.citon:target0')
@@ -239,7 +239,7 @@ def configure (conffile):
     config['system']['czstc_pid'] = config.get('system', 'czstc_pid', fallback='/var/run/czs-targetcontrol.pid')
     config['system']['ctld_conf'] = config.get('system', 'ctld_conf', fallback='/etc/ctl.conf')
     config['system']['ctld_pid'] = config.get('system', 'ctld_pid', fallback='/var/run/ctld.pid')
-    config['system']['fetch_serial_cmd'] = config.get('system', 'fetch_serial_cmd', fallback='/sbin/camcontrol -S {device}')
+    config['system']['fetch_serial_command'] = config.get('system', 'fetch_serial_command', fallback='/sbin/camcontrol -S {device}')
     config['system']['loglevel'] = config.get('system', 'loglevel', fallback='info')
 
     # Sanity check loglevel
@@ -248,7 +248,7 @@ def configure (conffile):
 
     # Sanity check log settings
     if 'syslog' in config:
-        config['syslog']['enabled'] = config.get('syslog', 'enabled', fallback='false')
+        config['syslog']['enable'] = config.get('syslog', 'enable', fallback='false')
 
         # Replace facility with the proper code
         if not re.match('user|daemon|syslog|local[0-7]', config.get('syslog', 'facility', fallback='daemon')):
@@ -260,11 +260,11 @@ def configure (conffile):
     else:
         logger.debug("No [syslog] section found in %s - Using defaults" % conffile)
         config['syslog'] = {}
-        config['syslog']['enabled'] = 'false'
+        config['syslog']['enable'] = 'false'
         config['syslog']['level'] = 'info'
 
     # Mail config
-    if ('mail' in config) and config.getboolean('mail', 'enabled'):
+    if ('mail' in config) and config.getboolean('mail', 'enable'):
         # Make sure everything is set.
         req = ['smtp_server', 'sender', 'recipients', 'subject_prefix'] 
         for item in req:
@@ -276,7 +276,7 @@ def configure (conffile):
                 config['mail']['recipients'] = config.get('mail', 'recipients').split(',')
     else:
         logger.debug("No [mail] section found in %s - Using defaults" % conffile)
-        config['mail'] = {'enabled': 'false'}
+        config['mail'] = {'enable': 'false'}
 
 
 def fix_device_path_nocheck (device):
@@ -304,7 +304,7 @@ def fix_device_path (device):
     """
 
     # Run it though our non-checking fixer first
-    device = fix_device_patch_nocheck(device)
+    device = fix_device_path_nocheck(device)
 
     # Now check that it is a block device.  Support for file backed LUNs can be added later.
     if not os.path.exists(device):
@@ -326,15 +326,28 @@ def fetch_device_serial (device):
     Returns a string with the trimmed first line of output form the command.
     """
     
+    # We are about to call a subprocess in a shell.  This is dangerous and part
+    # why we require the config file to be secured.  The following is a sanity
+    # check on the passed device to make sure only a-z, 0-9, -, _, /, and . are in the name
+    if not re.match(r'^\/[a-z0-9\.\-\-_\/]+$', device, flags=re.IGNORECASE):
+        raise GeneralError("Device name '%s' did not pass safety check.  Will not proceed." % device)
+    
     try:
         # Call our serial fetch command replacing {device} with the device path to check
-        serial = subprocess.check_output(config['system']['fetch_serial_command'].format(device=device))
+        serial_bytes = subprocess.check_output(config['system']['fetch_serial_command'].format(device=device), shell=True)
     
-    except (CalledProcessError, IOError, OSError) as err:
+    except (subprocess.CalledProcessError, IOError, OSError) as err:
         raise GeneralError("Unable to fetch serial number for %s using the command '%s'.  Error: %s" % (device,config['system']['fetch_serial_command'].format(device=device), err))
     
-    # Clean up and ship it
-    return serial.splitlines()[0].strip()
+    # Clean up the output and decode to ASCII
+    try:
+        serial = serial_bytes.decode('ascii').splitlines()[0].strip()
+
+    except UnicodeDecodeError:
+        raise GeneralError("Serial number fetch returned non-ASCII. Not usable for ctl.conf.")
+
+
+    return serial
 
     
 def split_ctld_config (ctldconfig):
@@ -348,12 +361,12 @@ def split_ctld_config (ctldconfig):
     # Search for the <czs:target> section.  Note - Old Paul would normally build a regex here.
     (prefix, x, target_section) = ctldconfig.partition('# <czs:target>')
     if not x:
-        logger.info("No <czs:target> section found in %s" % ctld_conf)
+        logger.info("No <czs:target> section found in %s" % config['system']['ctld_conf'])
         return (prefix, "", "")
     else:
         (target_section, x, postfix) = target_section.partition('# </czs:target>')
         if not x:
-            logger.warning("<czs:target> section missing closing </czs:target> in %s: may be corrupt!" % ctld_conf)
+            logger.warning("<czs:target> section missing closing </czs:target> in %s: may be corrupt!" % config['system']['ctld_conf'])
             return (prefix, target_section, "")
 
     return (prefix, target_section, postfix)
@@ -378,11 +391,11 @@ def targettext_to_luns (target_section):
     luns = {}
 
     # regex to match the XML-like metadata (comments) for a LUN section
-    pat = re.compile(r'<czs:lun\s+device=\"([a-z0-9\_\-\/]+)\"\s+id=\"(\d+)\"\s+serial=\"([a-z0-9]*)\"\s+time=\"([0-9 :\-\+a-z]+)\">.+?<\/czs:lun>', re.I | re.S)
+    pat = re.compile(r'<czs:lun\s+id=\"(\d+)\"\s+device=\"([a-z0-9\_\-\/]+)\"\s+serial=\"([a-z0-9]*)\"\s+addtime=\"([0-9 :\-\+\.a-z]+)\">.+?<\/czs:lun>', re.I | re.S)
     
     for match in pat.finditer(target_section):
-        device = match.group(1)
-        lunid = match.group(2)
+        lunid = match.group(1)
+        device = match.group(2)
         serial = match.group(3)
         addtime = match.group(4)
 
@@ -397,33 +410,32 @@ def targettext_to_luns (target_section):
 
 def luns_to_targettext (luns):
     """
-    Convert a multidemensional dict of luns into a new target section including lun sections
+    Convert a multidimensional dict of luns into a new target section including lun sections
     for insertion into ctl.conf
     """
 
-    # Build the header.  Note that the "<czs:target>" tags are not added here
-    targettemplate = """
-# !!! DO NOT MODIFY THE FOLOWING TARGET SECTION !!!
+    # Build the header.  Note that the "<czs:target>" tags are added back here
+    targettemplate = """# <czs:target>
+# !!! DO NOT MODIFY THE FOLLOWING TARGET SECTION !!!
 # Automatically generated by {ident}
-target {target_name} {
+target {target_name} {{
         auth-group {auth_group}
         portal_group {portal_group}
-
 {lunsections}
-}
-"""
+}}
+# </czs:target>"""
 
     # Build the template for use with each LUN section
     luntemplate = """
-        # <czs:lun device="{device}" id="{lunid}" serial="{serial}" addtime="{addtime}">
-        lun {lunid} {
+        # <czs:lun id="{lunid}" device="{device}" serial="{serial}" addtime="{addtime}">
+        lun {lunid} {{
                 path {device}
-        }
+        }}
         # </czs:lun>"""
 
     # Build up our lun sections
     luntext = ""
-    for lunid in luns:
+    for lunid in sorted(luns):
         luntext += luntemplate.format(device=luns[lunid]['device'], lunid=lunid, serial=luns[lunid]['serial'], addtime=luns[lunid]['addtime'])
 
     # Fill out the target section template and send it back
@@ -435,7 +447,7 @@ target {target_name} {
         lunsections = luntext)
 
 
-def add_device_to_luns (luns, device):
+def add_device_to_luns (device, luns):
     """
     Add a new LUN entry for the provided device path.  Returns and updated LUN dict.
     """
@@ -459,13 +471,17 @@ def add_device_to_luns (luns, device):
         return luns
 
     # Find the lowest free LUN and add a new entry
-    for lunid in range(0,255):
+    for i in range(0,255):
+        lunid = i.__str__()
         if not lunid in luns:
             # Found one!
+            luns[lunid] = {}
             luns[lunid]['device'] = device
             luns[lunid]['serial'] = fetch_device_serial(device)
             luns[lunid]['addtime'] = datetime.datetime.now().isoformat(' ')
             
+            logger.info("Adding LUN section for device %s (serial %s) with LUN %s" % (device, luns[lunid]['serial'], lunid))
+
             return luns
 
     # No free LUN IDs found.  Not good.
@@ -475,7 +491,7 @@ def add_device_to_luns (luns, device):
 
 
 
-def remove_device_from_luns (luns, device):
+def remove_device_from_luns (device, luns):
     """
     Remove an existing LUN entry for the provided device path.  Returns an updated LUN dict.
     """
@@ -485,7 +501,7 @@ def remove_device_from_luns (luns, device):
 
     for lunid in luns:
         if luns[lunid]['device'] == device:
-            logger.info("Unmapping device %s (serial %s) from LUN %s" % (device, luns[lunid]['serial'], lunid)) 
+            logger.info("Removing LUN section for device %s (serial %s) with LUN %s" % (device, luns[lunid]['serial'], lunid)) 
             del luns[lunid]
 
             return luns
@@ -496,17 +512,17 @@ def remove_device_from_luns (luns, device):
     return luns
 
 
-def ctld_conf_read (ctld_conf):
+def read_ctld_conf (ctld_conf):
     """
-    Read in current ctld config file, parse, and return a config dict with the following
-    keys:
-       prefix - Text before the autogenerated target section
-       postfix - Text after the autogenerated target section
+    Read in current ctld config file, parse, and return a tuple containing:
+       prefix - Text before the auto-generated target section
+       postfix - Text after the auto-generated target section
        luns - Sub-dict with LUN info indexed by LUN ID
     """
 
     try:
-        ctldconfig = open(ctld_conf, 'r').read()
+        with open(ctld_conf, 'r') as f:
+            ctldconfig = f.read()
 
     except (IOError, OSError) as err:
         raise GeneralError("Could not read in %s: %s" % (ctld_conf, err))
@@ -521,59 +537,103 @@ def ctld_conf_read (ctld_conf):
     return (prefix, postfix, luns)
     
 
-def ctld_conf_write (ctld_conf, prefix, postfix, luns):
+def write_ctld_conf (ctld_conf, prefix, postfix, luns):
     """
-    Write config file using the provided luns dictionary
+    Write config file using the provided luns dictionary.  Returns a the text that
+    was written to the file.
     """
 
-    #try:
-    #    ctldconfig = open(ctld_conf, 'r').read()
-    #
-    #except (IOError, OSError) as err:
-    #    raise GeneralError("Could not read in %s: %s" % (ctld_conf, err))
+    # Build the new config
+    ctldconfig = prefix + luns_to_targettext(luns) + postfix
 
-    # Parse and return
-    #logger.debug("Read ctl config file %s" % ctld_conf)
+    # Attempt to open the config file and write out changes
+    try:
+        with open(ctld_conf, 'w') as f:
+            b = f.write(ctldconfig)
+        
+    except (IOError, OSError) as err:
+        raise GeneralError("Could not write to %s: %s" % (ctld_conf, err))
 
-    #(prefix, target_section, postfix) = ctld_conf_split(ctldconfig)
-
-    #luns = ctld_conf_parse_luns(target_section)
+    logger.debug("Wrote %s bytes to %s" % (b, ctld_conf))
     
-    #return (prefix, postfix, luns)
+    return ctldconfig
     
+
+def report_luns_text (luns):
+    """
+    Make a human readable report of the lun to device mappings.
+    """
+
+    report = "CURRENT LUN TO DEVICE MAPPING(S):\n"
+    for lunid in sorted(luns):
+        report +=  "LUN: %s, DEVICE: %s, SERIAL: %s, TIME: %s\n" % (lunid, luns[lunid]['device'], luns[lunid]['serial'], luns[lunid]['addtime'])
+
+    return report
+
+
+def hup_ctld (pidfile):
+    """
+    Issue a SIGHUP to the process ID contained in the provided PID file
+    """
+
+    return True
+
 
 
 def main ():
     # Process CLI args (limited now)
-    parser = argparse.ArgumentParser()
-    parser.add_argument('action', metavar='ACTION', choices=['attach', 'detach'])
-    parser.add_argument('device', metavar='DEVICE')
-    parser.add_argument('--config', metavar='CONFIG', default=CONFFILE)
+    parser = argparse.ArgumentParser(
+        description="Manage presentation of raw devices as iSCSI LUNs",
+        epilog="The 'attach' and 'detach' actions require a device to be specified.")
+    parser.add_argument('action', metavar='ACTION', choices=['attach', 'detach', 'reset', 'list'], help="attach, detach, reset, or list")
+    parser.add_argument('device', metavar='DEVICE', nargs="?", default="", help="the device to attach or detach")
+    parser.add_argument('--config', metavar='CONFIG', default=CONFFILE, help="alternate config file")
     args = parser.parse_args()
 
-    # Pull in the config
-    configure(args.config)
-
-    # Finish logger setup
-    format = logging.Formatter('%(asctime)s %(name)s %(levelname)s %(message)s')
-    logger.setLevel(config['system']['level'].upper())
-
-    # Simple console logger
-    clog = logging.StreamHandler()
-    clog.setFormatter(format)
-    logger.addHandler(clog)
-
-    # Syslog
-    if config.getboolean('syslog', 'enabled'):
-        logger.addHandler(logging.handlers.SysLogHandler(facility=getattr(syslog, config['syslog']['facility'])))
+    # Make sure the device is set if we are attaching or detaching
+    if ((args.action=='attach' or args.action=='detach') and not args.device):
+        print("FATAL: You must specify a device after the 'attach' and 'detach' actions\n")    
+        parser.print_help()
+        exit(1)
     
-    # Email reporting
-    if config.getboolean('mail', 'enabled'):
-        elog = EmailReportHandler(config['mail']['smtp_server'], config['mail']['sender'], config['mail']['recipients'], config['mail']['subject_prefix'])
-        elog.setFormatter(format)
-        logger.addHandler(elog)
+    # Wrap initial config and steps before we have more alerting take hold
+    try:
+        # Pull in the config
+        configure(args.config)
+    
 
-    # Wrap the remainder - We will log this going forward
+        # If "list" is the action stop now and just spit out the current LUN list
+        if args.action == 'list':
+            (prefix, postfix, luns) = read_ctld_conf(config['system']['ctld_conf'])
+            print(report_luns_text(luns))
+            exit(0)
+
+
+        # Finish logger setup
+        format = logging.Formatter('%(asctime)s %(name)s %(levelname)s %(message)s')
+        logger.setLevel(config['system']['loglevel'].upper())
+
+        # Simple console logger
+        clog = logging.StreamHandler()
+        clog.setFormatter(format)
+        logger.addHandler(clog)
+
+        # Syslog
+        if config.getboolean('syslog', 'enable'):
+            logger.addHandler(logging.handlers.SysLogHandler(facility=getattr(syslog, config['syslog']['facility'])))
+    
+        # Email reporting
+        if config.getboolean('mail', 'enable'):
+            elog = EmailReportHandler(config['mail']['smtp_server'], config['mail']['sender'], config['mail']['recipients'], config['mail']['subject_prefix'])
+            elog.setFormatter(format)
+            logger.addHandler(elog)
+
+    except GeneralError as detail:
+        print("GeneralError: %s" % detail)
+        sys.exit(1)
+
+
+    # Wrap the remainder - We will log this going forward and only allow one instance at a time
     try:
         # Check for other running instances, wait a while, then die out if we can't get a lock
         retries = 6
@@ -590,20 +650,64 @@ def main ():
                     raise GeneralError("Timed out waiting for previous instance to complete")
             else:
                 break
-    
-        # Read in ctl.conf
-        print(ctld_conf_read(config['system']['ctld_conf']))
+
+        # Read in the current config
+        (prefix, postfix, luns) = read_ctld_conf(config['system']['ctld_conf'])
+        
+        # Count LUNs.  All our actions add or reduce the count so no compare is needed.
+        luncount = len(luns)
+        
+
+        if args.action=='attach':
+            # Add device to LUN list
+            luns = add_device_to_luns(args.device, luns)
+
+        elif args.action=='detach':
+            # Remove device to LUN list
+            luns = remove_device_from_luns(args.device, luns)
+
+
+        elif args.action=='reset':
+            # No LUNs!
+            luns = {}
+
+
+        # Check if there were additions
+        if luncount == len(luns):
+            logger.info("No change to write out")
+        
+        else:
+            # Write out an updated config
+            status = write_ctld_conf(config['system']['ctld_conf'], prefix, postfix, luns)
+
+            # Check if file update succeeded
+            if not status:
+                raise GeneralError("Update to %s failed.  Did not HUP ctld to signal config change" % config['system']['ctld_conf'])
+            
+
+            # Send a HUP signal to ctld to trigger a graceful configuration reload
+            status = hup_ctld(config['system']['ctld_pid'])
+            
+            if not status:
+                raise GeneralError("Configuration %s has been updated but did not successfully send HUP signal to ctld.  Restart ctld to force changes" % config['system']['ctld_conf'])
+            
+            logger.info("Configuration %s updated and ctld signaled to reread configuration" % config['system']['ctld_conf'])
+
+
 
     except GeneralError as detail:
         logger.warning("GeneralError: %s" % detail)
-        if config.getboolean('mail', 'enabled'):
+        if config.getboolean('mail', 'enable'):
             elog.send("FAIL", "GeneralError: %s\r\nPlease review the log and investigate as needed" % detail)
         sys.exit(1)
     
     else:
-        logger.info("Completed action \"%s\" on %s" % (args.action, args.device))
-        if config.getboolean('mail', 'enabled'):
-            elog.send("OK", "")
+        if args.action=='reset':
+            logger.info("Completed reset of LUNs to empty list")
+        else:
+            logger.info("Completed action \"%s\" on %s" % (args.action, args.device))
+        if config.getboolean('mail', 'enable'):
+            elog.send("OK", report_luns_text(luns))
 
     exit(0)
 

@@ -80,7 +80,7 @@ ctld_pid = /var/run/ctld.pid
 
 ::
 
-fetch_serial_cmd = /sbin/camcontrol -S {device}
+fetch_serial_command = /sbin/camcontrol -S {device}
 
 
 [syslog] Section:
