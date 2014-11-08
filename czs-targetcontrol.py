@@ -40,10 +40,10 @@
 VERSION = "v0.1 (2014-11-05)"
 
 # General imports
-import sys, os, stat, errno, subprocess, traceback, time, re, datetime
+import sys, os, stat, signal, subprocess, time, re, datetime
 
 # Logging and alerting
-import signal, logging, logging.handlers, smtplib, email, syslog
+import logging, logging.handlers, smtplib, email, syslog
 
 # Configuration handling
 import configparser, argparse
@@ -571,13 +571,63 @@ def report_luns_text (luns):
     return report
 
 
-def hup_ctld (pidfile):
+def life_check_ctld (pid):
     """
-    Issue a SIGHUP to the process ID contained in the provided PID file
+    Check if a given process is still amongst the living.
     """
+    
+    try:
+        # Errors out if process is not running
+        os.kill(pid, 0)
+        
+    except OSError:
+        # Not running
+        return False
 
     return True
+    
 
+def reload_ctld_conf (pidfile):
+    """
+    Signal the iSCSI target daemon to reload its config with poise and grace.
+    """
+    
+    # Try to get the current pid.  (Might want to change to use psutils and
+    # find the process ourselves, but for now we just trust the pid file.)
+    try:
+        # Errors out if not present or contains a non-int
+        pid = open(pidfile, 'r').read().strip()
+        pid = int(pid)
+
+    except (IOError, OSError) as err:
+        # Could not open pid file, or process not running - Either way,
+        # we have nothing to do
+        raise GeneralError("Unable to signal iSCSI daemon. Cannot open pid file %s: %s" % (pidfile, err))
+
+    except ValueError as err:
+        # Malformed pid file
+        raise GeneralError("Unable to signal iSCSI daemon. Unable to process pid file %s: %s" % (pidfile, err))
+   
+    
+    # Check if the daemon is actually running
+    if not life_check_ctld(pid):
+        # Flatline
+        raise GeneralError("Unable to signal iSCSI daemon.  %s present but process not running" % pidfile)
+
+    # HUP!
+    try:
+        os.kill(pid, signal.SIGHUP)
+    except OSError:
+        raise GeneralError("Unable to signal iSCSI daemon.  SIGHUP sent: %s" % err)
+
+    # Wait 1 second for processing
+    time.sleep(1)
+
+    # Still with us?
+    if not life_check_ctld(pid):
+        raise GeneralError("iSCSI daemon dead after SIGHUP!  Please invesitgate!")
+
+    return True
 
 
 def main ():
@@ -666,7 +716,6 @@ def main ():
             # Remove device to LUN list
             luns = remove_device_from_luns(args.device, luns)
 
-
         elif args.action=='reset':
             # No LUNs!
             luns = {}
@@ -686,7 +735,7 @@ def main ():
             
 
             # Send a HUP signal to ctld to trigger a graceful configuration reload
-            status = hup_ctld(config['system']['ctld_pid'])
+            status = reload_ctld_conf(config['system']['ctld_pid'])
             
             if not status:
                 raise GeneralError("Configuration %s has been updated but did not successfully send HUP signal to ctld.  Restart ctld to force changes" % config['system']['ctld_conf'])
@@ -696,7 +745,7 @@ def main ():
 
 
     except GeneralError as detail:
-        logger.warning("GeneralError: %s" % detail)
+        logger.error("%s" % detail)
         if config.getboolean('mail', 'enable'):
             elog.send("FAIL", "GeneralError: %s\r\nPlease review the log and investigate as needed" % detail)
         sys.exit(1)
