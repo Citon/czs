@@ -233,14 +233,16 @@ def configure (conffile):
         raise GeneralError("No [system] section in configuration file %s - EXITING" % conffile)
 
     # System config
+    config['system']['loglevel'] = config.get('system', 'loglevel', fallback='info')
     config['system']['target_name'] = config.get('system', 'target_name', fallback='iqn.1997-03.com.citon:target0')
     config['system']['auth_group'] = config.get('system', 'auth_group', fallback='no-authentication')
     config['system']['portal_group'] = config.get('system', 'portal_group', fallback='pg0')
     config['system']['czstc_pid'] = config.get('system', 'czstc_pid', fallback='/var/run/czs-targetcontrol.pid')
     config['system']['ctld_conf'] = config.get('system', 'ctld_conf', fallback='/etc/ctl.conf')
     config['system']['ctld_pid'] = config.get('system', 'ctld_pid', fallback='/var/run/ctld.pid')
+    config['system']['dummy_lun_img'] = config.get('system', 'dummy_lun_img', fallback='/root/czs-targercontrol-dummy-lun0.img')
     config['system']['fetch_serial_command'] = config.get('system', 'fetch_serial_command', fallback='/sbin/camcontrol inquiry {device} -S')
-    config['system']['loglevel'] = config.get('system', 'loglevel', fallback='info')
+
 
     # Sanity check loglevel
     if not re.match('debug|info|warning|error|critical', config['system']['loglevel']):
@@ -421,6 +423,12 @@ def luns_to_targettext (luns):
 target {target_name} {{
         auth-group {auth_group}
         portal-group {portal_group}
+
+        # Dummy LUN 0 - Required for each target set with ctld
+        lun 0 {{
+                path {dummy_lun_img}
+                serial deadbeef
+        }}
 {lunsections}
 }}
 # </czs:target>"""
@@ -430,6 +438,7 @@ target {target_name} {{
         # <czs:lun id="{lunid}" device="{device}" serial="{serial}" addtime="{addtime}">
         lun {lunid} {{
                 path {device}
+                serial {serial}
         }}
         # </czs:lun>"""
 
@@ -444,6 +453,7 @@ target {target_name} {{
         target_name = config['system']['target_name'],
         auth_group = config['system']['auth_group'],
         portal_group = config['system']['portal_group'],
+        dummy_lun_img = config['system']['dummy_lun_img'],
         lunsections = luntext)
 
 
@@ -470,8 +480,8 @@ def add_device_to_luns (device, luns):
         logger.info("Device %s already mapped to LUN %s - Skipping" % (device, lunid))
         return luns
 
-    # Find the lowest free LUN and add a new entry
-    for i in range(0,255):
+    # Find the lowest free LUN over 0 and add a new entry
+    for i in range(1,255):
         lunid = i.__str__()
         if not lunid in luns:
             # Found one!
