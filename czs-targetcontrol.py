@@ -270,15 +270,16 @@ def configure (conffile):
     if 'syslog' in config:
         config['syslog']['enable'] = config.get('syslog', 'enable', fallback='false')
 
-        # Replace facility with the proper code
+        # Check facility for proper code name
         if not re.match('user|daemon|syslog|local[0-7]', config.get('syslog', 'facility', fallback='daemon')):
             raise GeneralError("Invalid syslog facility %s in %s - Must be user, daemon, syslog, or local 0-7" % (config.get('syslog', 'facility'), conffile))
+
+        config['syslog']['syslog_server'] = config.get('syslog', 'syslog_server', fallback='/dev/log')
 
         # Replace with syslog facility
         config['syslog']['facility'] = 'LOG_' + config.get('syslog', 'facility', fallback='daemon').upper()
 
     else:
-        logger.debug("No [syslog] section found in %s - Using defaults" % conffile)
         config['syslog'] = {}
         config['syslog']['enable'] = 'false'
 
@@ -294,8 +295,35 @@ def configure (conffile):
             if item == 'recipients':
                 config['mail']['recipients'] = config.get('mail', 'recipients')
     else:
-        logger.debug("No [mail] section found in %s - Using defaults" % conffile)
         config['mail'] = {'enable': 'false'}
+
+    return True
+
+
+def fix_syslog_server (syslog_server):
+    """
+    Check input string for either a path or a host:port value.  Return a simple string if
+    it is a path or return a (host, port) tuple if a remote server is specified.
+    """
+
+    syslog_server = syslog_server.strip()
+
+    if syslog_server.startswith('/'):
+        # Looks like a path.  Check that it is there.
+        if not os.path.exists(syslog_server):
+            # Oh, you wanted to log?  Time to die.
+            raise GeneralError("Could not find syslog device %s" % syslog_server)
+
+    else:
+        # Try to extract a name/address and a port.
+        match = re.match(r'^([\da-z\.\-\:\[\]]+)\:(\d+)$', syslog_server)
+        if match:
+            syslog_server = (match.group(1), int(match.group(2)))
+
+        else:
+            raise GeneralError("Could not grok syslog_server value... what the heck is a %s ???" % syslog_server)
+
+    return syslog_server
 
 
 def fix_device_path_nocheck (device):
@@ -776,8 +804,14 @@ def main ():
 
         # Syslog
         if config.getboolean('syslog', 'enable'):
-            logger.addHandler(logging.handlers.SysLogHandler(facility=getattr(syslog, config['syslog']['facility'])))
-    
+            syslog_server = fix_syslog_server(config['syslog']['syslog_server'])
+            slog = logging.handlers.SysLogHandler(address=syslog_server, facility=getattr(syslog, config['syslog']['facility']))
+            # Use a more quiet log format since syslog already adds a date
+            syslog_format = logging.Formatter('%(name)s %(levelname)s %(message)s')
+            slog.setFormatter(syslog_format)
+            logger.addHandler(slog)
+            logger.debug("Enabled syslogging using facility %s" % getattr(syslog, config['syslog']['facility']))
+
         # Email reporting
         if config.getboolean('mail', 'enable'):
             elog = EmailReportHandler(config['mail']['smtp_server'], config['mail']['sender'], config['mail']['recipients'], config['mail']['subject_prefix'])
