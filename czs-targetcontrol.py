@@ -43,10 +43,14 @@ VERSION = "v0.1 (2014-11-05)"
 import sys, os, stat, signal, subprocess, time, re, datetime
 
 # Logging and alerting
-import logging, logging.handlers, smtplib, email, syslog
+import logging, logging.handlers, smtplib, email.message, syslog
 
 # Configuration handling
 import configparser, argparse
+
+# Optional DNS based device serial number to name lookup service.
+# Requires the pydns (py3dns) package which provides the DNS module
+import DNS
 
 # The name we want to report in logs and files for this script
 IDENT = 'csz-targetcontrol'
@@ -101,7 +105,8 @@ class EmailReportHandler(logging.Handler):
 
         self.smtpserver = smtpserver
         self.fromaddr = fromaddr
-        self.toaddrs = toaddrs
+        # From a CSV to an array.  Look ma - no regex!
+        self.toaddrs = [to.strip() for to in toaddrs.split(',')]
         self.subjectprefix = subjectprefix
 
         # Start with an empty buffer and a NOTSET (0) level high water mark
@@ -128,7 +133,7 @@ class EmailReportHandler(logging.Handler):
         
         body += self.buf
 
-        msg = email.Message.Message()
+        msg = email.message.Message()
 
         # Check maximum level and add a special note in the subject for anything
         # above INFO
@@ -155,8 +160,8 @@ class EmailReportHandler(logging.Handler):
 
 class singleInstance(object):
     """
-    PID file based single-instance check - Required since we are modifying a single
-    config file.  Based on recipe from:
+    PID file based single-instance check - Required since we are modifying a
+    single config file.  Based on recipe from:
     http://code.activestate.com/recipes/546512-creating-a-single-instance-application-linux-versi/
     """
                         
@@ -210,7 +215,8 @@ class singleInstance(object):
 
 def configure (conffile):
     """
-    Read configuration file into the global config dictionary and ensure sections are present
+    Read configuration file into the global config dictionary and ensure
+    sections are present
     """
 
     # Perform a quick (but race vulnerable) config file existence and permission
@@ -248,6 +254,18 @@ def configure (conffile):
     if not re.match('debug|info|warning|error|critical', config['system']['loglevel']):
             raise GeneralError("Invalid loglevel %s in %s - Must be debug, info, warning, error, or critical" % (config['system']['loglevel'], conffile))
 
+    # Sanity check device serial to name lookup settings
+    if 'lookup' in config:
+        config['lookup']['enable'] = config.get('lookup', 'enable', fallback='false')
+        config['lookup']['domain'] = config.get('lookup', 'domain')
+
+        # Prime the DNS system.  This uses /etc/resolv.conf.
+        DNS.DiscoverNameServers()
+
+    else:
+        config['lookup'] = {}
+        config['lookup']['enable'] = 'false'
+
     # Sanity check log settings
     if 'syslog' in config:
         config['syslog']['enable'] = config.get('syslog', 'enable', fallback='false')
@@ -263,7 +281,6 @@ def configure (conffile):
         logger.debug("No [syslog] section found in %s - Using defaults" % conffile)
         config['syslog'] = {}
         config['syslog']['enable'] = 'false'
-        config['syslog']['level'] = 'info'
 
     # Mail config
     if ('mail' in config) and config.getboolean('mail', 'enable'):
@@ -275,7 +292,7 @@ def configure (conffile):
             
             # Break out the recipient list
             if item == 'recipients':
-                config['mail']['recipients'] = config.get('mail', 'recipients').split(',')
+                config['mail']['recipients'] = config.get('mail', 'recipients')
     else:
         logger.debug("No [mail] section found in %s - Using defaults" % conffile)
         config['mail'] = {'enable': 'false'}
@@ -329,13 +346,14 @@ def fetch_device_serial (device):
     """
     
     # We are about to call a subprocess in a shell.  This is dangerous and part
-    # why we require the config file to be secured.  The following is a sanity
-    # check on the passed device to make sure only a-z, 0-9, -, _, /, and . are in the name
+    # of why we require the config file to be secured.  The following is a
+    # sanity check on the passed device to make sure only a-z, 0-9, -, _, /,
+    # and . are in the name
     if not re.match(r'^\/[a-z0-9\.\-\-_\/]+$', device, flags=re.IGNORECASE):
         raise GeneralError("Device name '%s' did not pass safety check.  Will not proceed." % device)
     
     try:
-        # Call our serial fetch command replacing {device} with the device path to check
+        # Call our serial fetch replacing {device} with the device path to check
         serial_bytes = subprocess.check_output(config['system']['fetch_serial_command'].format(device=device), shell=True)
     
     except (subprocess.CalledProcessError, IOError, OSError) as err:
@@ -351,16 +369,69 @@ def fetch_device_serial (device):
 
     return serial
 
+
+def translate_serial_to_name (serial):
+    """
+    CNAME lookup of device serial numbers to a friendly name. Requires
+    "serial-XXXXX" entries in the configured "domain".  The CNAME entries
+    should point to the name of the device. For example, if your lookup domain
+    is "czs.example.com" and the serial number of the device,
+    (as reported by camcontrol inquiry DEVICENAME -S), is "3413ef34", then this
+    function will check for the CNAME "serial-3413ef34.czs.example.com".  If
+    such a record existed and were named "czs1234.czs.example.com", this method
+    would return "czs1234"
+
+    Returns the friendly device name on sucess or the serial back as passed
+    on failure.
+    """
     
+    # Push the serial to lower case
+    serial = serial.lower()
+
+    # Cleanup serial number to only include valid DNS text and report any
+    # changes in debug
+    nserial = re.sub(r'[^a-z0-9\-]', r'', serial)
+    
+    if serial != nserial:
+        logger.info("Using \"%s\" instead of \"%s\" for CNAME lookup" % (nserial, serial))
+        serial = nserial
+    
+    # The name to resolve
+    sname = "serial-" + serial + '.' + config['lookup']['domain']
+
+    # Give it a go
+    request = DNS.Request(qtype="CNAME", name=sname)
+    response = request.req()
+
+    if response.answers and 'data' in response.answers[0]:
+        devname = response.answers[0]['data']
+        
+        # Verify the result and return with the domain stripped off
+        if devname.endswith('.' + config['lookup']['domain']):
+            devname = devname[:-len('.' + config['lookup']['domain'])]
+            logger.info("Successfully resolved %s to device name %s" % (serial, devname))
+            return devname
+
+        else:
+            logger.warning("Invalid data in CNAME lookup for %s: %s" % (serial, devname))
+
+    else:
+        logger.info("Did not find CNAME for %s - Using device serial number for iSCSI" % sname)
+
+    # Fell through, so just return the serial
+    return serial
+
+
 def split_ctld_config (ctldconfig):
     """
-    Given the full text of a ctl.conf file, return a tuple with prefix, target section,
-    and postfix text.
+    Given the full text of a ctl.conf file, return a tuple with prefix, target
+    section, and postfix text.
     """
     prefix = ""
     postfix = ""
 
-    # Search for the <czs:target> section.  Note - Old Paul would normally build a regex here.
+    # Search for the <czs:target> section.  Note - Old Paul would normally
+    # build a regex here.
     (prefix, x, target_section) = ctldconfig.partition('# <czs:target>')
     if not x:
         logger.info("No <czs:target> section found in %s" % config['system']['ctld_conf'])
@@ -376,8 +447,8 @@ def split_ctld_config (ctldconfig):
 
 def build_ctld_config (prefix, target_section, postfix):
     """
-    Given a prefix, ready built target section, and postfix, return the fill text of
-    a new ctl.conf file.
+    Given a prefix, ready built target section, and postfix, return the full
+    text of a new ctl.conf file.
     """
     
     # Fairly simple for now
@@ -386,24 +457,27 @@ def build_ctld_config (prefix, target_section, postfix):
     
 def targettext_to_luns (target_section):
     """
-    Break a target section into a dictionary of LUN section information.  Uses metadata in the
-    file so anything outside of a <czs:lun></czs:lun> section gets ignored.
+    Break a target section into a dictionary of LUN section information.
+    Uses metadata in the file so anything outside of a <czs:lun></czs:lun>
+    section gets ignored, including the always enabled dummy LUN 0
     """
     
     luns = {}
 
     # regex to match the XML-like metadata (comments) for a LUN section
-    pat = re.compile(r'<czs:lun\s+id=\"(\d+)\"\s+device=\"([a-z0-9\_\-\/]+)\"\s+serial=\"([a-z0-9]*)\"\s+addtime=\"([0-9 :\-\+\.a-z]+)\">.+?<\/czs:lun>', re.I | re.S)
+    pat = re.compile(r'<czs:lun\s+id=\"(\d+)\"\s+name=\"([a-z0-9\-]*)\"\s+path=\"([a-z0-9\_\-\/]+)\"\s+serial=\"([a-z0-9]*)\"\s+addtime=\"([0-9 :\-\+\.a-z]+)\">.+?<\/czs:lun>', re.I | re.S)
     
     for match in pat.finditer(target_section):
         lunid = match.group(1)
-        device = match.group(2)
-        serial = match.group(3)
-        addtime = match.group(4)
+        name = match.group(2)
+        device = match.group(3)
+        serial = match.group(4)
+        addtime = match.group(5)
 
-        logger.debug("Found LUN section in ctl config for device %s (serial %s) with LUN %s" % (device, serial, lunid))
+        logger.debug("Found LUN section for device name %s (path %s, serial %s) with LUN %s" % (name, device, serial, lunid))
         luns[lunid] = {}
         luns[lunid]['device'] = device
+        luns[lunid]['name'] = name
         luns[lunid]['serial'] = serial
         luns[lunid]['addtime'] = addtime
 
@@ -412,8 +486,8 @@ def targettext_to_luns (target_section):
 
 def luns_to_targettext (luns):
     """
-    Convert a multidimensional dict of luns into a new target section including lun sections
-    for insertion into ctl.conf
+    Convert a multidimensional dict of luns into a new target section including
+    lun sections for insertion into ctl.conf.
     """
 
     # Build the header.  Note that the "<czs:target>" tags are added back here
@@ -435,17 +509,17 @@ target {target_name} {{
 
     # Build the template for use with each LUN section
     luntemplate = """
-        # <czs:lun id="{lunid}" device="{device}" serial="{serial}" addtime="{addtime}">
+        # <czs:lun id="{lunid}" name="{name}" path="{device}" serial="{serial}" addtime="{addtime}">
         lun {lunid} {{
                 path {device}
-                serial {serial}
+                serial {name}
         }}
         # </czs:lun>"""
 
     # Build up our lun sections
     luntext = ""
     for lunid in sorted(luns):
-        luntext += luntemplate.format(device=luns[lunid]['device'], lunid=lunid, serial=luns[lunid]['serial'], addtime=luns[lunid]['addtime'])
+        luntext += luntemplate.format(device=luns[lunid]['device'], lunid=lunid, name=luns[lunid]['name'], serial=luns[lunid]['serial'], addtime=luns[lunid]['addtime'])
 
     # Fill out the target section template and send it back
     return targettemplate.format(
@@ -459,14 +533,20 @@ target {target_name} {{
 
 def add_device_to_luns (device, luns):
     """
-    Add a new LUN entry for the provided device path.  Returns and updated LUN dict.
+    Add a new LUN entry for the provided device path.  Returns an updated LUN
+    dict and a status message string.  Checks for same device path already
+    being shared and skips making changes.  Changing to check for duplicate
+    names/serial numbers instead could be better but there would need to be
+    a lot of checking to make sure bad lookups/duplicate serials don't creep
+    in and ruin the show.
     """
     
     # Cleanup the device name and make sure it exists
     t = fix_device_path(device)
     if not t:
-        logger.warning("Failed to find device %s - Not adding to LUNs" % device)
-        return luns
+        msg = "Failed to find device %s - Not adding to LUNs" % device
+        logger.warning(msg)
+        return (luns, msg)
     device = t
 
     # Make sure the device is not already in the list
@@ -477,8 +557,16 @@ def add_device_to_luns (device, luns):
             break
 
     if device_exists:
-        logger.info("Device %s already mapped to LUN %s - Skipping" % (device, lunid))
-        return luns
+        msg = "Device %s already mapped to LUN %s" % (device, lunid)
+        logger.info(msg)
+        return (luns, msg)
+
+    # Lookup the serial and name
+    serial = fetch_device_serial(device)
+    if config.getboolean('lookup', 'enable'):
+        name = translate_serial_to_name(serial)
+    else:
+        name = serial
 
     # Find the lowest free LUN over 0 and add a new entry
     for i in range(1,255):
@@ -487,23 +575,27 @@ def add_device_to_luns (device, luns):
             # Found one!
             luns[lunid] = {}
             luns[lunid]['device'] = device
-            luns[lunid]['serial'] = fetch_device_serial(device)
+            luns[lunid]['name'] = name
+            luns[lunid]['serial'] = serial
             luns[lunid]['addtime'] = datetime.datetime.now().isoformat(' ')
             
-            logger.info("Adding LUN section for device %s (serial %s) with LUN %s" % (device, luns[lunid]['serial'], lunid))
+            msg = "Mapped device %s (path %s, serial %s) to LUN %s" % (name, device, serial, lunid)
+            logger.info(msg)
 
-            return luns
+            return (luns, msg)
 
     # No free LUN IDs found.  Not good.
-    logger.warning("Unable to map device %s (serial %s) - No free LUNs found" % (device, serial))
+    msg = "Unable to map device %s (path %s, serial %s) - No free LUNs found" % (name, device, serial)
+    logger.warning(msg)
 
-    return luns
+    return (luns, msg)
 
 
 
 def remove_device_from_luns (device, luns):
     """
-    Remove an existing LUN entry for the provided device path.  Returns an updated LUN dict.
+    Remove an existing LUN entry for the provided device path.  Returns an
+    updated LUN dict and message string.
     """
 
     # Cleanup the device name without checking if it is present. (Because it probably ain't!)
@@ -511,15 +603,16 @@ def remove_device_from_luns (device, luns):
 
     for lunid in luns:
         if luns[lunid]['device'] == device:
-            logger.info("Removing LUN section for device %s (serial %s) with LUN %s" % (device, luns[lunid]['serial'], lunid)) 
+            msg = "Unmapped device %s (path %s, serial %s) from LUN %s" % (luns[lunid]['name'], device, luns[lunid]['serial'], lunid)
+            logger.info(msg)
             del luns[lunid]
 
-            return luns
+            return (luns, msg)
 
     # Device was not mapped.  Note and move along
-    logger.info("Could not unmap device %s - Not currently mapped" % device)
+    msg = "Could not unmap device path %s - Not currently mapped" % device
 
-    return luns
+    return (luns, msg)
 
 
 def read_ctld_conf (ctld_conf):
@@ -528,6 +621,9 @@ def read_ctld_conf (ctld_conf):
        prefix - Text before the auto-generated target section
        postfix - Text after the auto-generated target section
        luns - Sub-dict with LUN info indexed by LUN ID
+    
+    The original target section is discarded and is built from scratch
+    upon update.
     """
 
     try:
@@ -549,8 +645,8 @@ def read_ctld_conf (ctld_conf):
 
 def write_ctld_conf (ctld_conf, prefix, postfix, luns):
     """
-    Write config file using the provided luns dictionary.  Returns a the text that
-    was written to the file.
+    Write config file using the provided luns dictionary.  Returns a the text
+    that was written to the file.
     """
 
     # Build the new config
@@ -576,7 +672,7 @@ def report_luns_text (luns):
 
     report = "CURRENT LUN TO DEVICE MAPPING(S):\n"
     for lunid in sorted(luns):
-        report +=  "LUN: %s, DEVICE: %s, SERIAL: %s, TIME: %s\n" % (lunid, luns[lunid]['device'], luns[lunid]['serial'], luns[lunid]['addtime'])
+        report +=  "LUN: %s, NAME: %s, PATH: %s, SERIAL: %s, TIME: %s\n" % (lunid, luns[lunid]['name'], luns[lunid]['device'], luns[lunid]['serial'], luns[lunid]['addtime'])
 
     return report
 
@@ -693,9 +789,11 @@ def main ():
         sys.exit(1)
 
 
-    # Wrap the remainder - We will log this going forward and only allow one instance at a time
+    # Wrap the remainder - We will log this going forward and only allow one
+    # instance at a time
     try:
-        # Check for other running instances, wait a while, then die out if we can't get a lock
+        # Check for other running instances, wait a while, then die out if we
+        # can't get a lock
         retries = 6
         waittime = 10
         while retries:
@@ -714,21 +812,23 @@ def main ():
         # Read in the current config
         (prefix, postfix, luns) = read_ctld_conf(config['system']['ctld_conf'])
         
-        # Count LUNs.  All our actions add or reduce the count so no compare is needed.
+        # Count LUNs.  All our actions add or reduce the count so no compare
+        # is needed.
         luncount = len(luns)
         
 
         if args.action=='attach':
             # Add device to LUN list
-            luns = add_device_to_luns(args.device, luns)
+            (luns, msg) = add_device_to_luns(args.device, luns)
 
         elif args.action=='detach':
             # Remove device to LUN list
-            luns = remove_device_from_luns(args.device, luns)
+            (luns, msg) = remove_device_from_luns(args.device, luns)
 
         elif args.action=='reset':
             # No LUNs!
             luns = {}
+            msg = "Cleared all LUN mappings"
 
 
         # Check if there were additions
@@ -744,7 +844,8 @@ def main ():
                 raise GeneralError("Update to %s failed.  Did not HUP ctld to signal config change" % config['system']['ctld_conf'])
             
 
-            # Send a HUP signal to ctld to trigger a graceful configuration reload
+            # Send a HUP signal to ctld to trigger a graceful configuration
+            # reload
             status = reload_ctld_conf(config['system']['ctld_pid'])
             
             if not status:
@@ -757,16 +858,21 @@ def main ():
     except GeneralError as detail:
         logger.error("%s" % detail)
         if config.getboolean('mail', 'enable'):
-            elog.send("FAIL", "GeneralError: %s\r\nPlease review the log and investigate as needed" % detail)
+            if args.action=="reset":
+                elog.send("FAIL - Did not complete %s" % args.action, "GeneralError: %s\r\nPlease review the log and investigate as needed" % detail)
+            else:
+                elog.send("FAIL - Did not complete %s for device %s" % (args.action, args.device), "GeneralError: %s\r\nPlease review the log and investigate as needed" % detail)
         sys.exit(1)
     
     else:
         if args.action=='reset':
             logger.info("Completed reset of LUNs to empty list")
+            if config.getboolean('mail', 'enable'):
+                elog.send("OK - %s"  % msg, report_luns_text(luns) + "\n\n------ LOG ------\n")
         else:
-            logger.info("Completed action \"%s\" on %s" % (args.action, args.device))
-        if config.getboolean('mail', 'enable'):
-            elog.send("OK", report_luns_text(luns))
+            logger.info("Completed %s on device %s" % (args.action, args.device))
+            if config.getboolean('mail', 'enable'):
+                elog.send("OK - %s" % msg , report_luns_text(luns) + "\n\n------ LOG ------\n")
 
     exit(0)
 
