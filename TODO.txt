@@ -1,0 +1,4 @@
+
+* Add management of authentication and portals to allow a zero-preconfiguration
+  option for those who don't really feel like learning about targetcli
+* Add a light interface to provide status
