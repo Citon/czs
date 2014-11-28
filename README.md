@@ -1,9 +1,9 @@
 =========================================================================
- csz-targetcontrol - Citon ZFS Seed iSCSI Injector Station Device Mapper 
+ csz - Citon ZFS Seed System
 =========================================================================
 
 These scripts are for use with seeding ZFS replication for remote sites with
-limited bandwidth.
+limited bandwidth and related functions.
 
 
 COMPONENTS
@@ -17,7 +17,7 @@ COMPONENTS
 REQUIREMENTS
 ------------
 
-* Requires Python 3.2+ and py3dns
+* czs-targetcontrol.py Requires Python 3.2+ and py3dns
 
 
 INSTALLATION

@@ -1,4 +1,4 @@
-#!/usr/local/bin/python3
+#!/usr/bin/python3
 
 # czs-targetcontrol - Citon ZFS Seed iSCSI injection station control script.
 
@@ -29,7 +29,7 @@
 # THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ##
-# This is designed to run on a FreeBSD system with a multitude of USB/other
+# This is designed to run on a  system with a multitude of USB/other
 # ports allowing attachment of seed data drives.  When a drive is attached
 # it is automatically shared as a iSCSI LUN.  The LUN is destroyed when the
 # drive is detached.
@@ -37,7 +37,7 @@
 # Requires Python 3.2+ because the future is now
 ##
 
-VERSION = "v0.1 (2014-11-05)"
+VERSION = "v0.2 (2014-11-15)"
 
 # General imports
 import sys, os, stat, signal, subprocess, time, re, datetime
@@ -45,12 +45,23 @@ import sys, os, stat, signal, subprocess, time, re, datetime
 # Logging and alerting
 import logging, logging.handlers, smtplib, email.message, syslog
 
+# rtslib - The LIO API
+import rtslib
+
+# PyUDEV used for device query
+import pyudev
+
 # Configuration handling
 import configparser, argparse
 
 # Optional DNS based device serial number to name lookup service.
 # Requires the pydns (py3dns) package which provides the DNS module
 import DNS
+
+# Set the number of seconds to wait if a previous instance is detected as running
+# and the maximum times to check before dying out
+WAIT_SECONDS = 10
+WAIT_RETRIES = 6
 
 # The name we want to report in logs and files for this script
 IDENT = 'csz-targetcontrol'
@@ -238,22 +249,37 @@ def configure (conffile):
     if not config.has_section('system'):
         raise GeneralError("No [system] section in configuration file %s - EXITING" % conffile)
 
-    # System config
+    # System config. Items commented out are features from the FreeBSD
+    # code that need to be recoded into the LIO version.
     config['system']['loglevel'] = config.get('system', 'loglevel', fallback='info')
     config['system']['target_name'] = config.get('system', 'target_name', fallback='iqn.1997-03.com.citon:target0')
-    config['system']['auth_group'] = config.get('system', 'auth_group', fallback='no-authentication')
-    config['system']['portal_group'] = config.get('system', 'portal_group', fallback='pg0')
-    config['system']['czstc_pid'] = config.get('system', 'czstc_pid', fallback='/var/run/czs-targetcontrol.pid')
-    config['system']['ctld_conf'] = config.get('system', 'ctld_conf', fallback='/etc/ctl.conf')
-    config['system']['ctld_pid'] = config.get('system', 'ctld_pid', fallback='/var/run/ctld.pid')
-    config['system']['dummy_lun_img'] = config.get('system', 'dummy_lun_img', fallback='/root/czs-targercontrol-dummy-lun0.img')
-    config['system']['fetch_serial_command'] = config.get('system', 'fetch_serial_command', fallback='/sbin/camcontrol inquiry {device} -S')
+    config['system']['serial_attribute'] = config.get('system', 'serial_attribute', fallback='ID_SERIAL_SHORT')
+    config['system']['czstc_pid'] = config.get('system', 'czstc_pid', fallback='/var/run/czs-targetcontrol.pid') 
 
+    # XXX Not yet implemented - Will need more sanity check code to prevent
+    # swapping device LUNs on reboot
+    #config['system']['save_changes'] = config.get('system', 'save_changes', fallback='true')
 
+    # XXX Implemented for attach but not detach
+    # # Set to "true" to normalize all devices to use the by-id path for access.
+    # This is recommended for most uses. When enabled, the /dev/disk/by-id/
+    # path will automatically be selected regardless of how the device ID is
+    # passed.
+    # !!! DO NOT CHANGE THIS UNLESS ALL DEVICES ARE UNMAPPED !!!  If some devices
+    # are already mapped, you may be unable to add/remove devices accurately.
+    #by_id = true
+    config['system']['by_id'] = config.get('system', 'by_id', fallback='false')
+
+    # Gone for now.  May work back in for easier startup or updated FreeBSD port
+    #config['system']['auth_group'] = config.get('system', 'auth_group', fallback='no-authentication')
+    #config['system']['portal_group'] = config.get('system', 'portal_group', fallback='pg0')
+    #config['system']['target_config'] = config.get('system', 'target_config', fallback='/etc/ctl.conf')
+    #config['system']['dummy_lun_img'] = config.get('system', 'dummy_lun_img', fallback='/root/czs-targercontrol-dummy-lun0.img')
+    
     # Sanity check loglevel
     if not re.match('debug|info|warning|error|critical', config['system']['loglevel']):
             raise GeneralError("Invalid loglevel %s in %s - Must be debug, info, warning, error, or critical" % (config['system']['loglevel'], conffile))
-
+    
     # Sanity check device serial to name lookup settings
     if 'lookup' in config:
         config['lookup']['enable'] = config.get('lookup', 'enable', fallback='false')
@@ -271,7 +297,7 @@ def configure (conffile):
         config['syslog']['enable'] = config.get('syslog', 'enable', fallback='false')
 
         # Check facility for proper code name
-        if not re.match('user|daemon|syslog|local[0-7]', config.get('syslog', 'facility', fallback='daemon')):
+        if not re.match('user|daemon|syslog|local[0-7]', config.get('syslog', 'facility', fallback='local0')):
             raise GeneralError("Invalid syslog facility %s in %s - Must be user, daemon, syslog, or local 0-7" % (config.get('syslog', 'facility'), conffile))
 
         config['syslog']['syslog_server'] = config.get('syslog', 'syslog_server', fallback='/dev/log')
@@ -367,35 +393,57 @@ def fix_device_path (device):
     return device
 
 
-def fetch_device_serial (device):
+def fetch_device_path_and_serial (device):
     """
-    Attempt to use camcontrol to fetch the serial number for a given device.
-    Returns a string with the trimmed first line of output form the command.
+    Attempt to fetch the preferred path and serial number for a
+    given device. Returns the prefered device path and a precleaned
+    serial number string on success.  A munged version of the device
+    name is used if no serial number is available.
     """
     
-    # We are about to call a subprocess in a shell.  This is dangerous and part
-    # of why we require the config file to be secured.  The following is a
-    # sanity check on the passed device to make sure only a-z, 0-9, -, _, /,
-    # and . are in the name
-    if not re.match(r'^\/[a-z0-9\.\-\-_\/]+$', device, flags=re.IGNORECASE):
+    # Sanity check on the device name
+    if not re.match(r'^\/[a-z0-9\:\.\-_\/]+$', device, flags=re.IGNORECASE):
         raise GeneralError("Device name '%s' did not pass safety check.  Will not proceed." % device)
     
-    try:
-        # Call our serial fetch replacing {device} with the device path to check
-        serial_bytes = subprocess.check_output(config['system']['fetch_serial_command'].format(device=device), shell=True)
-    
-    except (subprocess.CalledProcessError, IOError, OSError) as err:
-        raise GeneralError("Unable to fetch serial number for %s using the command '%s'.  Error: %s" % (device,config['system']['fetch_serial_command'].format(device=device), err))
-    
-    # Clean up the output and decode to ASCII
-    try:
-        serial = serial_bytes.decode('ascii').splitlines()[0].strip()
 
-    except UnicodeDecodeError:
-        raise GeneralError("Serial number fetch returned non-ASCII. Not usable for ctl.conf.")
+    # Look for the device using UDEV
+    matched = 0
+
+    context = pyudev.Context()
+    for dev in context.list_devices(subsystem='block').match_property('DEVTYPE', 'disk'):
+        # Allow for device name to be the main DEVNAME property
+        if dev['DEVNAME'] == device:
+            matched = 1
+            break
+
+        # ...or be included in the list of DEVLINKS
+        m = re.search(r'(^|\s)(%s)($|\s)' % device, dev['DEVLINKS'])
+        if m:
+            matched = 1
+            break
+
+    # Translate to our prefered path if so configured
+    PREFERRED_PATH = r'/dev/disk/by-id/'
+    if matched and config['system']['by_id']:
+        m = re.search(r'(^|\s)(%s.+?)($|\s)' % PREFERRED_PATH, dev['DEVLINKS'])
+        if m:
+            device = m.group(2)
+            # Another sanity check on the device.  (Now the prefered path)
+            if not re.match(r'^\/[a-z0-9\:\.\-_\/]+$', device, flags=re.IGNORECASE):
+                raise GeneralError("Device name '%s' did not pass safety check.  Will not proceed." % device)
+
+            logger.debug("Using \"%s\" for device path" % device)
+
+        else:
+            logger.debug("Could not find device link under %s for requested device \"%s\"" % (PREFERRED_PATH, device))
 
 
-    return serial
+    if matched and config['system']['serial_attribute'] in dev:
+        # Try to pull the long serial
+        return (device, dev[config['system']['serial_attribute']])
+    else:
+        # Oh well - Return a sanitized version of the device name
+        return (device, re.sub(r'[^a-z0-9\-]', r'-', device).strip('-'))
 
 
 def translate_serial_to_name (serial):
@@ -417,9 +465,14 @@ def translate_serial_to_name (serial):
     serial = serial.lower()
 
     # Cleanup serial number to only include valid DNS text and report any
-    # changes in debug
-    nserial = re.sub(r'[^a-z0-9\-]', r'', serial)
+    # changes in debug.
+    nserial = re.sub(r'[^a-z0-9\-]', r'-', serial)
     
+    # It must also be no more than 63 chars long, minus "serial-".
+    # (So, 56 chars or less).  Truncation is done starting at the front
+    # to maintiain the most unique portion in a typical serial.
+    nserial = nserial[len(nserial) - 56:]
+
     if serial != nserial:
         logger.info("Using \"%s\" instead of \"%s\" for CNAME lookup" % (nserial, serial))
         serial = nserial
@@ -444,119 +497,69 @@ def translate_serial_to_name (serial):
             logger.warning("Invalid data in CNAME lookup for %s: %s" % (serial, devname))
 
     else:
-        logger.info("Did not find CNAME for %s - Using device serial number for iSCSI" % sname)
+        logger.info("Alias not found in DNS - Using device serial number %s for iSCSI name. (Add a CNAME for %s to correct this)" % (serial, sname))
 
     # Fell through, so just return the serial
     return serial
 
-
-def split_ctld_config (ctldconfig):
-    """
-    Given the full text of a ctl.conf file, return a tuple with prefix, target
-    section, and postfix text.
-    """
-    prefix = ""
-    postfix = ""
-
-    # Search for the <czs:target> section.  Note - Old Paul would normally
-    # build a regex here.
-    (prefix, x, target_section) = ctldconfig.partition('# <czs:target>')
-    if not x:
-        logger.info("No <czs:target> section found in %s" % config['system']['ctld_conf'])
-        return (prefix, "", "")
-    else:
-        (target_section, x, postfix) = target_section.partition('# </czs:target>')
-        if not x:
-            logger.warning("<czs:target> section missing closing </czs:target> in %s: may be corrupt!" % config['system']['ctld_conf'])
-            return (prefix, target_section, "")
-
-    return (prefix, target_section, postfix)
-
-
-def build_ctld_config (prefix, target_section, postfix):
-    """
-    Given a prefix, ready built target section, and postfix, return the full
-    text of a new ctl.conf file.
-    """
     
-    # Fairly simple for now
-    return prefix + "# <czs:target>\n" + target_section.strip() + "\n# </czs:target>\n" + postfix
-
-    
-def targettext_to_luns (target_section):
+def fetch_target (targetname):
     """
-    Break a target section into a dictionary of LUN section information.
-    Uses metadata in the file so anything outside of a <czs:lun></czs:lun>
-    section gets ignored, including the always enabled dummy LUN 0
+    Given a target name, return either the rtslib target object or None.
+    """
+
+    target = None
+    try:
+        root = rtslib.RTSRoot()
+        
+        for t in root.targets:
+            if t.wwn == config['system']['target_name']:
+                # Matched!
+                target = t
+                break
+
+    except rtslib.utils.RTSLibError as err:
+        raise GeneralError("RTSLib error when trying to fetch target object %s: %s" % (targetname, err))
+
+    return target
+        
+
+def enumerate_luns (target):
+    """
+    Return a dictionary of currently configured LUNs for our target
     """
     
     luns = {}
 
-    # regex to match the XML-like metadata (comments) for a LUN section
-    pat = re.compile(r'<czs:lun\s+id=\"(\d+)\"\s+name=\"([a-z0-9\-]*)\"\s+path=\"([a-z0-9\_\-\/]+)\"\s+serial=\"([a-z0-9]*)\"\s+addtime=\"([0-9 :\-\+\.a-z]+)\">.+?<\/czs:lun>', re.I | re.S)
-    
-    for match in pat.finditer(target_section):
-        lunid = match.group(1)
-        name = match.group(2)
-        device = match.group(3)
-        serial = match.group(4)
-        addtime = match.group(5)
+    if not target:
+        raise GeneralError("Target not defined!  You must configure %s using targetcli before using this system!" % config['system']['target_name'])
+
+    # Only target group 1 is supported at this time.  If you want different
+    # auth sets/etc then make another whole target/WWN
+    tpgs = next(target.tpgs)
+
+    for lun in tpgs.luns:
+        lunid = str(lun.lun)
+
+        # Bye LUN 0
+        if lunid == '0':
+            continue
+
+        name = lun.storage_object.name
+        device = lun.storage_object.udev_path
+        # If by_id is enabled this will not only give us a serial but will
+        # force the device path to our prefered path.
+        (device, serial) = fetch_device_path_and_serial(device)
+        device_syspath = lun.storage_object.path
 
         logger.debug("Found LUN section for device name %s (path %s, serial %s) with LUN %s" % (name, device, serial, lunid))
         luns[lunid] = {}
         luns[lunid]['device'] = device
         luns[lunid]['name'] = name
         luns[lunid]['serial'] = serial
-        luns[lunid]['addtime'] = addtime
+        luns[lunid]['device_syspath'] = device_syspath
 
     return luns
-
-
-def luns_to_targettext (luns):
-    """
-    Convert a multidimensional dict of luns into a new target section including
-    lun sections for insertion into ctl.conf.
-    """
-
-    # Build the header.  Note that the "<czs:target>" tags are added back here
-    targettemplate = """# <czs:target>
-# !!! DO NOT MODIFY THE FOLLOWING TARGET SECTION !!!
-# Automatically generated by {ident}
-target {target_name} {{
-        auth-group {auth_group}
-        portal-group {portal_group}
-
-        # Dummy LUN 0 - Required for each target set with ctld
-        lun 0 {{
-                path {dummy_lun_img}
-                serial deadbeef
-        }}
-{lunsections}
-}}
-# </czs:target>"""
-
-    # Build the template for use with each LUN section
-    luntemplate = """
-        # <czs:lun id="{lunid}" name="{name}" path="{device}" serial="{serial}" addtime="{addtime}">
-        lun {lunid} {{
-                path {device}
-                serial {name}
-        }}
-        # </czs:lun>"""
-
-    # Build up our lun sections
-    luntext = ""
-    for lunid in sorted(luns):
-        luntext += luntemplate.format(device=luns[lunid]['device'], lunid=lunid, name=luns[lunid]['name'], serial=luns[lunid]['serial'], addtime=luns[lunid]['addtime'])
-
-    # Fill out the target section template and send it back
-    return targettemplate.format(
-        ident=IDENT,
-        target_name = config['system']['target_name'],
-        auth_group = config['system']['auth_group'],
-        portal_group = config['system']['portal_group'],
-        dummy_lun_img = config['system']['dummy_lun_img'],
-        lunsections = luntext)
 
 
 def add_device_to_luns (device, luns):
@@ -581,16 +584,12 @@ def add_device_to_luns (device, luns):
     device_exists = 0
     for lunid in luns:
         if luns[lunid]['device'] == device:
-            device_exists = 1
-            break
+            msg = "Device %s already mapped to LUN %s" % (device, lunid)
+            logger.info(msg)
+            return (luns, msg)
 
-    if device_exists:
-        msg = "Device %s already mapped to LUN %s" % (device, lunid)
-        logger.info(msg)
-        return (luns, msg)
-
-    # Lookup the serial and name
-    serial = fetch_device_serial(device)
+    # Lookup the device prefered path, serial, and name
+    (device, serial) = fetch_device_path_and_serial(device)
     if config.getboolean('lookup', 'enable'):
         name = translate_serial_to_name(serial)
     else:
@@ -598,23 +597,50 @@ def add_device_to_luns (device, luns):
 
     # Find the lowest free LUN over 0 and add a new entry
     for i in range(1,255):
-        lunid = i.__str__()
+        lunid = str(i)
         if not lunid in luns:
             # Found one!
             luns[lunid] = {}
             luns[lunid]['device'] = device
             luns[lunid]['name'] = name
             luns[lunid]['serial'] = serial
-            luns[lunid]['addtime'] = datetime.datetime.now().isoformat(' ')
-            
-            msg = "Mapped device %s (path %s, serial %s) to LUN %s" % (name, device, serial, lunid)
-            logger.info(msg)
+            break
 
-            return (luns, msg)
+    if not lunid:
+        # No free LUN IDs found.  Not good.
+        msg = "Unable to map device %s (path %s, serial %s) - No free LUNs found" % (name, device, serial)
+        logger.warning(msg)
 
-    # No free LUN IDs found.  Not good.
-    msg = "Unable to map device %s (path %s, serial %s) - No free LUNs found" % (name, device, serial)
-    logger.warning(msg)
+        return (luns, msg)
+
+    # Build the backing device
+    try:
+        bso = rtslib.BlockStorageObject(name=name,dev=device,wwn=name)
+
+    except rtslib.utils.RTSLibError as err:
+        raise GeneralError("RTSLib error when trying to define block device object %s: %s" % (device, err))
+
+
+    # Get the device control path for the iBlock storage
+    luns[lunid]['device_syspath'] = bso.path
+
+    # Write the name into place before mapping
+    #write_device_name(device, luns)
+
+    # Map the LUN
+    try:
+        target = fetch_target(config['system']['target_name'])
+        # Only target group 1 is supported at this time.  If you want different
+        # auth sets/etc then make another whole target/WWN
+        tpgs = next(target.tpgs)
+
+        lun = rtslib.LUN(tpgs, lun=lunid, storage_object=bso, alias=name)
+
+    except rtslib.utils.RTSLibError as err:
+        raise GeneralError("RTSLib error when trying to map LUN %s to device object %s: %s" % (lunid, device, err))
+
+    msg = "Mapped device %s (path %s, serial %s) to LUN %s" % (name, device, serial, lunid)
+    logger.info(msg)
 
     return (luns, msg)
 
@@ -628,70 +654,39 @@ def remove_device_from_luns (device, luns):
 
     # Cleanup the device name without checking if it is present. (Because it probably ain't!)
     device = fix_device_path_nocheck(device)
-
+    found = 0
     for lunid in luns:
         if luns[lunid]['device'] == device:
-            msg = "Unmapped device %s (path %s, serial %s) from LUN %s" % (luns[lunid]['name'], device, luns[lunid]['serial'], lunid)
-            logger.info(msg)
-            del luns[lunid]
+            found = 1
+            break
+        
+    if not found:
+        # Device was not mapped.  Note and move along
+        msg = "Could not unmap device path %s - Not currently mapped" % device
+        return (luns, msg)
 
-            return (luns, msg)
+    # Unmap the LUN and destroy the backing device.  It's a cruel world.
+    try:
+        target = fetch_target(config['system']['target_name'])
+        # Only target group 1 is supported at this time.  If you want different
+        # auth sets/etc then make another whole target/WWN
+        tpgs = next(target.tpgs)
+        
+        lun = tpgs.lun(lunid)
+        so = lun.storage_object
 
-    # Device was not mapped.  Note and move along
-    msg = "Could not unmap device path %s - Not currently mapped" % device
+        lun.delete()
+        so.delete()
 
+    except rtslib.utils.RTSLibError as err:
+        raise GeneralError("RTSLib error when trying to unmap LUN %s from device object %s: %s" % (lunid, device, err))
+    
+    msg = "Unmapped device %s (path %s, serial %s) from LUN %s" % (luns[lunid]['name'], device, luns[lunid]['serial'], lunid)
+    logger.info(msg)
+    del luns[lunid]
+    
     return (luns, msg)
 
-
-def read_ctld_conf (ctld_conf):
-    """
-    Read in current ctld config file, parse, and return a tuple containing:
-       prefix - Text before the auto-generated target section
-       postfix - Text after the auto-generated target section
-       luns - Sub-dict with LUN info indexed by LUN ID
-    
-    The original target section is discarded and is built from scratch
-    upon update.
-    """
-
-    try:
-        with open(ctld_conf, 'r') as f:
-            ctldconfig = f.read()
-
-    except (IOError, OSError) as err:
-        raise GeneralError("Could not read in %s: %s" % (ctld_conf, err))
-
-    # Parse and return
-    logger.debug("Read ctl config file %s" % ctld_conf)
-
-    (prefix, target_section, postfix) = split_ctld_config(ctldconfig)
-
-    luns = targettext_to_luns(target_section)
-    
-    return (prefix, postfix, luns)
-    
-
-def write_ctld_conf (ctld_conf, prefix, postfix, luns):
-    """
-    Write config file using the provided luns dictionary.  Returns a the text
-    that was written to the file.
-    """
-
-    # Build the new config
-    ctldconfig = prefix + luns_to_targettext(luns) + postfix
-
-    # Attempt to open the config file and write out changes
-    try:
-        with open(ctld_conf, 'w') as f:
-            b = f.write(ctldconfig)
-        
-    except (IOError, OSError) as err:
-        raise GeneralError("Could not write to %s: %s" % (ctld_conf, err))
-
-    logger.debug("Wrote %s bytes to %s" % (b, ctld_conf))
-    
-    return ctldconfig
-    
 
 def report_luns_text (luns):
     """
@@ -700,9 +695,10 @@ def report_luns_text (luns):
 
     report = "CURRENT LUN TO DEVICE MAPPING(S):\n"
     for lunid in sorted(luns):
-        report +=  "LUN: %s, NAME: %s, PATH: %s, SERIAL: %s, TIME: %s\n" % (lunid, luns[lunid]['name'], luns[lunid]['device'], luns[lunid]['serial'], luns[lunid]['addtime'])
+        report +=  "LUN: %s, NAME: %s, PATH: %s, SERIAL: %s\n" % (lunid, luns[lunid]['name'], luns[lunid]['device'], luns[lunid]['serial'])
 
     return report
+
 
 
 def life_check_ctld (pid):
@@ -720,48 +716,6 @@ def life_check_ctld (pid):
 
     return True
     
-
-def reload_ctld_conf (pidfile):
-    """
-    Signal the iSCSI target daemon to reload its config with poise and grace.
-    """
-    
-    # Try to get the current pid.  (Might want to change to use psutils and
-    # find the process ourselves, but for now we just trust the pid file.)
-    try:
-        # Errors out if not present or contains a non-int
-        pid = open(pidfile, 'r').read().strip()
-        pid = int(pid)
-
-    except (IOError, OSError) as err:
-        # Could not open pid file, or process not running - Either way,
-        # we have nothing to do
-        raise GeneralError("Unable to signal iSCSI daemon. Cannot open pid file %s: %s" % (pidfile, err))
-
-    except ValueError as err:
-        # Malformed pid file
-        raise GeneralError("Unable to signal iSCSI daemon. Unable to process pid file %s: %s" % (pidfile, err))
-   
-    
-    # Check if the daemon is actually running
-    if not life_check_ctld(pid):
-        # Flatline
-        raise GeneralError("Unable to signal iSCSI daemon.  %s present but process not running" % pidfile)
-
-    # HUP!
-    try:
-        os.kill(pid, signal.SIGHUP)
-    except OSError:
-        raise GeneralError("Unable to signal iSCSI daemon.  SIGHUP sent: %s" % err)
-
-    # Wait 1 second for processing
-    time.sleep(1)
-
-    # Still with us?
-    if not life_check_ctld(pid):
-        raise GeneralError("iSCSI daemon dead after SIGHUP!  Please invesitgate!")
-
-    return True
 
 
 def main ():
@@ -788,8 +742,7 @@ def main ():
 
         # If "list" is the action stop now and just spit out the current LUN list
         if args.action == 'list':
-            (prefix, postfix, luns) = read_ctld_conf(config['system']['ctld_conf'])
-            print(report_luns_text(luns))
+            print(report_luns_text(enumerate_luns(fetch_target(config['system']['target_name']))))
             exit(0)
 
 
@@ -828,8 +781,8 @@ def main ():
     try:
         # Check for other running instances, wait a while, then die out if we
         # can't get a lock
-        retries = 6
-        waittime = 10
+        retries = WAIT_RETRIES
+        waittime = WAIT_SECONDS
         while retries:
             retries -= 1
             thisapp = singleInstance(config['system']['czstc_pid'])
@@ -843,13 +796,8 @@ def main ():
             else:
                 break
 
-        # Read in the current config
-        (prefix, postfix, luns) = read_ctld_conf(config['system']['ctld_conf'])
-        
-        # Count LUNs.  All our actions add or reduce the count so no compare
-        # is needed.
-        luncount = len(luns)
-        
+        # Pull the current LUN list
+        luns = enumerate_luns(fetch_target(config['system']['target_name']))
 
         if args.action=='attach':
             # Add device to LUN list
@@ -860,35 +808,16 @@ def main ():
             (luns, msg) = remove_device_from_luns(args.device, luns)
 
         elif args.action=='reset':
-            # No LUNs!
-            luns = {}
-            msg = "Cleared all LUN mappings"
+            # No LUNS, except 0 which is left alone
+            for lunid in luns:
+                (luns, msg) = remove_device_from_luns(luns[lunid]['device'], luns)
 
+            msg = "Cleared all LUN mappings other than 0"
 
-        # Check if there were additions
-        if luncount == len(luns):
-            logger.info("No change to write out")
+            
+        #logger.info("Configuration updated")
         
-        else:
-            # Write out an updated config
-            status = write_ctld_conf(config['system']['ctld_conf'], prefix, postfix, luns)
-
-            # Check if file update succeeded
-            if not status:
-                raise GeneralError("Update to %s failed.  Did not HUP ctld to signal config change" % config['system']['ctld_conf'])
-            
-
-            # Send a HUP signal to ctld to trigger a graceful configuration
-            # reload
-            status = reload_ctld_conf(config['system']['ctld_pid'])
-            
-            if not status:
-                raise GeneralError("Configuration %s has been updated but did not successfully send HUP signal to ctld.  Restart ctld to force changes" % config['system']['ctld_conf'])
-            
-            logger.info("Configuration %s updated and ctld signaled to reread configuration" % config['system']['ctld_conf'])
-
-
-
+    
     except GeneralError as detail:
         logger.error("%s" % detail)
         if config.getboolean('mail', 'enable'):
@@ -904,7 +833,7 @@ def main ():
             if config.getboolean('mail', 'enable'):
                 elog.send("OK - %s"  % msg, report_luns_text(luns) + "\n\n------ LOG ------\n")
         else:
-            logger.info("Completed %s on device %s" % (args.action, args.device))
+            logger.info("Completed %s on device %s with status: %s" % (args.action, args.device, msg))
             if config.getboolean('mail', 'enable'):
                 elog.send("OK - %s" % msg , report_luns_text(luns) + "\n\n------ LOG ------\n")
 
