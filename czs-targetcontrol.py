@@ -393,12 +393,13 @@ def fix_device_path (device):
     return device
 
 
-def fetch_device_path_and_serial (device):
+def fetch_device_path_and_serial (device, default_serial=""):
     """
     Attempt to fetch the preferred path and serial number for a
     given device. Returns the prefered device path and a precleaned
-    serial number string on success.  A munged version of the device
-    name is used if no serial number is available.
+    serial number string on success.  If default_serial is defined
+    it will be returned if the serial number lookup fails, else a 
+    munged version of the device name is used.
     """
     
     # Sanity check on the device name
@@ -417,14 +418,19 @@ def fetch_device_path_and_serial (device):
             break
 
         # ...or be included in the list of DEVLINKS
-        m = re.search(r'(^|\s)(%s)($|\s)' % device, dev['DEVLINKS'])
-        if m:
-            matched = 1
-            break
+        if 'DEVLINKS' in dev:
+            m = re.search(r'(^|\s)(%s)($|\s)' % device, dev['DEVLINKS'])
+            if m:
+                matched = 1
+                break
+    
+    # If the device is not present in UDEV we should just return
+    if not matched:
+        return (device, default_serial)
 
-    # Translate to our prefered path if so configured
-    PREFERRED_PATH = r'/dev/disk/by-id/'
-    if matched and config['system']['by_id']:
+    if config.getboolean('system', 'by_id'):
+        # Translate to our prefered path if so configured
+        PREFERRED_PATH = r'/dev/disk/by-id/'
         m = re.search(r'(^|\s)(%s.+?)($|\s)' % PREFERRED_PATH, dev['DEVLINKS'])
         if m:
             device = m.group(2)
@@ -436,14 +442,18 @@ def fetch_device_path_and_serial (device):
 
         else:
             logger.debug("Could not find device link under %s for requested device \"%s\"" % (PREFERRED_PATH, device))
-
-
-    if matched and config['system']['serial_attribute'] in dev:
+            
+            
+    if config['system']['serial_attribute'] in dev:
         # Try to pull the long serial
-        return (device, dev[config['system']['serial_attribute']])
+        serial = dev[config['system']['serial_attribute']]
+    elif default_serial != "":
+        serial = default_serial
     else:
         # Oh well - Return a sanitized version of the device name
-        return (device, re.sub(r'[^a-z0-9\-]', r'-', device).strip('-'))
+        serial = re.sub(r'[^a-z0-9\-]', r'-', device).strip('-')
+
+    return (device, serial)
 
 
 def translate_serial_to_name (serial):
@@ -562,7 +572,7 @@ def enumerate_luns (target):
     return luns
 
 
-def add_device_to_luns (device, luns):
+def add_device_to_luns (device, luns, default_serial=""):
     """
     Add a new LUN entry for the provided device path.  Returns an updated LUN
     dict and a status message string.  Checks for same device path already
@@ -589,7 +599,7 @@ def add_device_to_luns (device, luns):
             return (luns, msg)
 
     # Lookup the device prefered path, serial, and name
-    (device, serial) = fetch_device_path_and_serial(device)
+    (device, serial) = fetch_device_path_and_serial(device, default_serial="")
     if config.getboolean('lookup', 'enable'):
         name = translate_serial_to_name(serial)
     else:
@@ -726,6 +736,7 @@ def main ():
     parser.add_argument('action', metavar='ACTION', choices=['attach', 'detach', 'reset', 'list'], help="attach, detach, reset, or list")
     parser.add_argument('device', metavar='DEVICE', nargs="?", default="", help="the device to attach or detach")
     parser.add_argument('--config', metavar='CONFIG', default=CONFFILE, help="alternate config file")
+    parser.add_argument('--serial', metavar='SERIAL', default="", help="explicitly define serial number to use for drive")
     args = parser.parse_args()
 
     # Make sure the device is set if we are attaching or detaching
@@ -801,7 +812,7 @@ def main ():
 
         if args.action=='attach':
             # Add device to LUN list
-            (luns, msg) = add_device_to_luns(args.device, luns)
+            (luns, msg) = add_device_to_luns(args.device, luns, default_serial=args.serial)
 
         elif args.action=='detach':
             # Remove device to LUN list
