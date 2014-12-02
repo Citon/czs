@@ -9,21 +9,95 @@ limited bandwidth and related functions.
 COMPONENTS
 ----------
 
-* czs-targetcontrol.py - Python script for use with FreeBSD "injector" system.
+* czs-targetcontrol.py - Python script for use with Linux LIO "injector" system.
 * czs-targetcontrol.conf - Configuration file.  Normally kept in /etc
-* ctl.conf - iSCSI target configuration file.  Normally kept in /etc
 * czs-targetcontrol-dummy-lun0.img - Small disk image to back always-on LUN0
 
 REQUIREMENTS
 ------------
 
-* czs-targetcontrol.py Requires Python 3.2+ and py3dns
+* czs-targetcontrol.py Requires Python 3.2+, py3dns, and pyudev.  A dedicated
+  Linux workstation is suggested with two NICs.  One for management and one
+  for storage networking.
 
 
 INSTALLATION
 ------------
 
-TBC
+
+Instructions are for Debian based systems, including TurnKey Linux.  (TurnKey
+Core amd64 is recommended for czs
+* Install python3, python3-dns, python3-pip, lio-utils, targetcli, and sudo packages
+
+ apt-get install python3 python3-dns lio-utils targetcli sudo
+
+* Install the RTSLib-FB Python framework for LIO management:
+
+ pip-3.2 install rtslib-fb
+
+* Copy czs-targetcontrol.py into /usr/local/bin and fix permissions
+
+ cp czs-targetcontrol.py /usr/local/bin
+ chown root.root /usr/local/bin/czs-targetcontrol.py
+ chmod 755 /usr/local/bin/czs-targetcontrol.py
+
+* Copy examples/czs-targetcontrol.conf into /etc and fix permissions  
+
+ cp examples/czs-targetcontrol.conf /etc
+ chown root.root /etc/czs-targetcontrol.conf
+ chmod 640 /etc/czs-targetcontrol.conf
+
+* Copy examples/czs-targetcontrol-dummy-lun0.img to permanent location
+
+ cp examples/czs-targetcontrol-dummy-lun0.img /root
+ chown root.root /root/czs-targetcontrol-dummy-lun0.img
+ chmod 600 /root/czs-targetcontrol-dummy-lun0.img
+
+* Use targetcli to setup your LUN 0 back store
+  and target group
+
+ targetcli
+
+ cd backstores/fileio
+ create czs-dummy-lun0 /root/czs-targetcontrol-dummy-lun0.img 666k
+
+* Create your new target.  The IQN below should be modified to match
+  your environment.  Using the FQDN of your injector, reversed, is 
+  recommended.  For instance, if your injector is named "test.example.com"
+  and example.com was registered in May of 2014, your IQN could be:
+  iqn.2014-05.com.example.test:czs.
+
+ cd /iscsi 
+ create IQN
+
+* Configure a portal on your storage target IP.  Please consider using a 2nd
+  NIC and isolated storage network!  If you do not, you MUST configure some
+  sort of authentication to prevent unauthorized access to the iSCSI targets
+  on the machine.  Replace TARGETIP with your storage IP:
+ 
+ portals/ create TARGETIP
+
+* Configure authentication for the portal.  This example opens all access and
+  can ONLY be used with an isolated storage network. See LIO documentation
+  for other authentication setup information. ( http://www.linux-iscsi.org/Doc/RTS%20OS%20Admin%20Manual.pdf )
+
+ set  attribute authentication=0 demo_mode_write_protect=0 generate_node_acls=1 cache_dynamic_acls=1
+
+* Map LUN0 to the new target.
+
+ cd <
+ luns/ create /backstores/fileio/dummy0
+ cd <
+
+* See what you did
+ 
+ cd /
+ ls
+
+* Save it!
+
+ saveconfig
+
 
 
 CONFIGURATION
@@ -44,45 +118,12 @@ file - czs-targetcontrol.conf.   The following parameters can be adjusted:
 
  target_name = iqn.1997-03.com.citon:target0
 
-* Set the ctld "auth-group" to use.  If you are not using an isolated storage network it is strongly advised that you enable authentication for iSCSI access. Define your auth settings in ctl.conf then reference the section with this variable.
-
- auth_group = no-authentication
-
-* Set the iSCSI portal-group to use.  A portal group defines what address(es) the iSCSI target daemon listens on and common settings for connections to the group.  This MUST be defined in the ctl.conf file!
-
-::
-
- portal_group = pg0
-
 * Set the pid file for this script to use to prevent multiple instances from modifying configurations at the same time.
 
 ::
 
  czstc_pid = /var/run/czs-targetcontrol.pid
 
-* Direct the script to the ctl.conf ctld config file.  This file will be manipulated directly.
-
-::
-
- ctld_conf = /etc/ctl.conf
-
-* Point to the pid file for the ctld daemon.  This is required in order to issue a HUP signal to the daemon, triggering a graceful configuration update.
-
-::
-
- ctld_pid = /var/run/ctld.pid
-
-* Path to the "dummy LUN0" disk image.  This is a small (666KB if using the provided file) FAT formatted disk image.  ctld requires that LUN 0 is always present for a given target.  This is a problem for czs-targetcontrol since it allows removing/adding devices in any order.  By always serving up a LUN 0, ctld will be happy.
-
-::
-
- dummy_lun_img = /root/czs-targetcontrol-dummy-lun0.img
-
-* Define a command line to execute that will return the serial number for a given block device.  The first line of output will be used.
-
-::
-
- fetch_serial_command = /sbin/camcontrol inquiry {device} -S
 
 
 [lookup] Section:
@@ -158,10 +199,7 @@ TBC
 
 ADDITIONAL INFORMATION
 ----------------------
-* *pydoc czs-targetcontrol.py* - Embedded documentation
-* *man ctl.conf* - Documentation for the ctld configuration file
-* *man ctld* - Documentation for the cltd daemon 
-* *https://www.freebsd.org/doc/handbook/network-iscsi.html* - FreeBSD Handbook section for iSCSI
+
 
 
 

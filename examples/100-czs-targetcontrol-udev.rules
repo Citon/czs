@@ -1,9 +1,0 @@
-# czs-targetcontrol-udev.conf - Trigger czs-targetcontrol to map/unmap
-# removable devices from iSCSI target LUNs automatically
-
-# Make sure to modify the KERNEL=="sd[b-z]*" match in both lines below
-# to avoid any disks you don't want mapped.  See "man 7 udev" for info.
-
-KERNEL=="sd[b-z]*", ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ATTR{removable}=="1",  PROGRAM="/usr/local/bin/czs-targetcontrol.py attach %k"
-KERNEL=="sd[b-z]*", ACTION=="remove", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ATTR{removable}=="1", PROGRAM="/usr/local/bin/czs-targetcontrol.py detach %k"
-

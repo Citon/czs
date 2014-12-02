@@ -393,13 +393,12 @@ def fix_device_path (device):
     return device
 
 
-def fetch_device_path_and_serial (device, default_serial=""):
+def fetch_device_path_and_serial (device):
     """
     Attempt to fetch the preferred path and serial number for a
     given device. Returns the prefered device path and a precleaned
-    serial number string on success.  If default_serial is defined
-    it will be returned if the serial number lookup fails, else a 
-    munged version of the device name is used.
+    serial number string on success.  Uses a munged version of the
+    device name if no serial can be found.
     """
     
     # Sanity check on the device name
@@ -426,7 +425,7 @@ def fetch_device_path_and_serial (device, default_serial=""):
     
     # If the device is not present in UDEV we should just return
     if not matched:
-        return (device, default_serial)
+        return (device, "UNKNOWN")
 
     if config.getboolean('system', 'by_id'):
         # Translate to our prefered path if so configured
@@ -572,7 +571,7 @@ def enumerate_luns (target):
     return luns
 
 
-def add_device_to_luns (device, luns, default_serial=""):
+def add_device_to_luns (device, luns):
     """
     Add a new LUN entry for the provided device path.  Returns an updated LUN
     dict and a status message string.  Checks for same device path already
@@ -599,7 +598,7 @@ def add_device_to_luns (device, luns, default_serial=""):
             return (luns, msg)
 
     # Lookup the device prefered path, serial, and name
-    (device, serial) = fetch_device_path_and_serial(device, default_serial="")
+    (device, serial) = fetch_device_path_and_serial(device)
     if config.getboolean('lookup', 'enable'):
         name = translate_serial_to_name(serial)
     else:
@@ -622,7 +621,7 @@ def add_device_to_luns (device, luns, default_serial=""):
         logger.warning(msg)
 
         return (luns, msg)
-
+    
     # Build the backing device
     try:
         bso = rtslib.BlockStorageObject(name=name,dev=device,wwn=name)
@@ -633,9 +632,6 @@ def add_device_to_luns (device, luns, default_serial=""):
 
     # Get the device control path for the iBlock storage
     luns[lunid]['device_syspath'] = bso.path
-
-    # Write the name into place before mapping
-    #write_device_name(device, luns)
 
     # Map the LUN
     try:
@@ -674,7 +670,7 @@ def remove_device_from_luns (device, luns):
         # Device was not mapped.  Note and move along
         msg = "Could not unmap device path %s - Not currently mapped" % device
         return (luns, msg)
-
+    
     # Unmap the LUN and destroy the backing device.  It's a cruel world.
     try:
         target = fetch_target(config['system']['target_name'])
@@ -736,7 +732,6 @@ def main ():
     parser.add_argument('action', metavar='ACTION', choices=['attach', 'detach', 'reset', 'list'], help="attach, detach, reset, or list")
     parser.add_argument('device', metavar='DEVICE', nargs="?", default="", help="the device to attach or detach")
     parser.add_argument('--config', metavar='CONFIG', default=CONFFILE, help="alternate config file")
-    parser.add_argument('--serial', metavar='SERIAL', default="", help="explicitly define serial number to use for drive")
     args = parser.parse_args()
 
     # Make sure the device is set if we are attaching or detaching
@@ -809,10 +804,10 @@ def main ():
 
         # Pull the current LUN list
         luns = enumerate_luns(fetch_target(config['system']['target_name']))
-
+        
         if args.action=='attach':
             # Add device to LUN list
-            (luns, msg) = add_device_to_luns(args.device, luns, default_serial=args.serial)
+            (luns, msg) = add_device_to_luns(args.device, luns)
 
         elif args.action=='detach':
             # Remove device to LUN list
@@ -820,15 +815,13 @@ def main ():
 
         elif args.action=='reset':
             # No LUNS, except 0 which is left alone
-            for lunid in luns:
+            lunst = luns
+            for lunid in lunst:
                 (luns, msg) = remove_device_from_luns(luns[lunid]['device'], luns)
 
             msg = "Cleared all LUN mappings other than 0"
 
             
-        #logger.info("Configuration updated")
-        
-    
     except GeneralError as detail:
         logger.error("%s" % detail)
         if config.getboolean('mail', 'enable'):
