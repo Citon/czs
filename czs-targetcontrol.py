@@ -2,7 +2,7 @@
 
 # czs-targetcontrol - Citon ZFS Seed iSCSI injection station control script.
 
-# Copyright(c) 2014, Citon Computer Corporation
+# Copyright(c) 2015, Citon Computer Corporation
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -37,7 +37,7 @@
 # Requires Python 3.2+ because the future is now
 ##
 
-VERSION = "v0.2 (2014-11-15)"
+VERSION = "v0.3 (2015-06-05)"
 
 # General imports
 import sys, os, stat, signal, subprocess, time, re, datetime
@@ -46,7 +46,7 @@ import sys, os, stat, signal, subprocess, time, re, datetime
 import logging, logging.handlers, smtplib, email.message, syslog
 
 # rtslib - The LIO API
-import rtslib
+import rtslib_fb as rtslib
 
 # PyUDEV used for device query
 import pyudev
